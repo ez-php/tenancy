@@ -69,6 +69,42 @@ afterwards, even on exceptions:
 $context->run($store->find('acme'), fn () => $importer->import());
 ```
 
+For queue jobs you can let the queue carry the tenant instead: wrap the bound queue in
+`TenantAwareQueue`. A job pushed while a tenant is active is stored with that tenant's id, and
+the worker's `pop()` makes the same tenant active again before the job runs (also for retries
+and `queue:failed retry`):
+
+```php
+use EzPhp\Contracts\QueueInterface;
+use EzPhp\Tenancy\Queue\TenantAwareQueue;
+
+// in your provider's register(), after QueueServiceProvider
+$this->app->bind(QueueInterface::class, fn ($app) => new TenantAwareQueue(
+    $app->make(\EzPhp\Queue\Driver\DatabaseDriver::class), // the real driver
+    $app->make(TenantContext::class),
+    $app->make(TenantStoreInterface::class),
+));
+```
+
+Like `ez-php/queue`'s `UniqueQueue`, the decorator hides the driver's failed-job repository, so
+bind `FailedJobRepositoryInterface` to the driver yourself if you use `queue:failed`.
+
+### Streamed responses
+
+`ResolveTenantMiddleware` deactivates the tenant when the action returns, but a
+`StreamedResponse` (`download()`, `sse()`) writes its body later, while the response is
+sent. Capture the tenant in the action and re-activate it inside the stream:
+
+```php
+$tenant = $this->tenants->current();
+
+return StreamedResponse::sse(function () use ($tenant): \Generator {
+    yield from $this->tenants->run($tenant, fn (): array => $this->events->forCurrentTenant());
+});
+```
+
+Without that, tenant-scoped services used while streaming throw "No tenant is active".
+
 ### Tenant-scoped cache (`ez-php/cache`)
 
 ```php

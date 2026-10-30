@@ -7,6 +7,7 @@ namespace Tests\Middleware;
 use EzPhp\Http\Request;
 use EzPhp\Http\Response;
 use EzPhp\Http\ResponseInterface;
+use EzPhp\Http\StreamedResponse;
 use EzPhp\Tenancy\ArrayTenantStore;
 use EzPhp\Tenancy\Middleware\ResolveTenantMiddleware;
 use EzPhp\Tenancy\Resolver\HeaderResolver;
@@ -106,6 +107,33 @@ final class ResolveTenantMiddlewareTest extends TestCase
         }
 
         self::assertSame($outer, $this->context->get());
+    }
+
+    /**
+     * A streamed body is written after the middleware returned, so the tenant is no
+     * longer active there; capturing it and re-activating it with run() is the
+     * documented way (README § Streamed responses).
+     */
+    public function test_a_streamed_body_runs_after_the_tenant_is_restored(): void
+    {
+        $response = $this->middleware()->handle(self::request('acme'), function (): ResponseInterface {
+            $tenant = $this->context->current();
+
+            return new StreamedResponse(function () use ($tenant): \Generator {
+                yield $this->context->check() ? 'active' : 'inactive';
+                yield $this->context->run($tenant, fn (): string => $this->context->current()->id);
+            });
+        });
+
+        self::assertInstanceOf(StreamedResponse::class, $response);
+
+        $body = '';
+        $response->writeBody(static function (string $chunk) use (&$body): void {
+            $body .= $chunk . ';';
+        });
+
+        self::assertSame('inactive;acme;', $body);
+        self::assertFalse($this->context->check());
     }
 
     /**

@@ -151,7 +151,7 @@ php make_module.php <name> --description="..." --services=mysql,redis --extensio
 
 `<name>` is the kebab-case package name; the namespace is derived as
 `EzPhp\<PascalCase>` (each `-`-separated word upper-cased) unless `--namespace=`
-overrides it. Existing exceptions the guess gets wrong: `asyncapi` → `AsyncApi`,
+overrides it. Existing exceptions the guess gets wrong: `asyncapi` → `AsyncApi`, `asyncapi-ui` → `AsyncApiUi`,
 `bignum` → `BigNum`, `dataloader` → `DataLoader`, `dotenv` → `Env`, `graphql` → `GraphQL`, `graphql-subscriptions` → `GraphQLSubscriptions`, `oauth` → `OAuth`,
 `opcache` → `OPCache`, `openapi` → `OpenApi`, `qrcode` → `QrCode`, `swagger-ui` → `SwaggerUI`, `webauthn` → `WebAuthn` and
 `websocket` → `WebSocket`; `websocket-client` → `WebsocketClient`, `websocket-tls` → `WebsocketTls`,
@@ -293,6 +293,9 @@ src/
 │   └── ResolveTenantMiddleware.php    — resolve → validate → store lookup → activate; 404 or optional; restores previous tenant
 ├── Cache/
 │   └── TenantScopedCache.php          — CacheInterface via a PrefixedCache per active tenant (ez-php/cache)
+├── Queue/
+│   ├── TenantAwareQueue.php           — QueueInterface decorator: push() stores the active tenant id in an envelope, pop() unwraps and activates it (clears it otherwise), failed() keeps it
+│   └── TenantQueueEnvelope.php        — JobInterface envelope {job, tenantId}; getters delegate to the job; handle()/fail() delegate when popped without the decorator
 └── Search/
     └── TenantScopedSearchDriver.php   — SearchDriverInterface decorator, `<id>_<index>` (ez-php/search)
 
@@ -304,7 +307,8 @@ tests/
 ├── TenancyServiceProviderTest.php                — shared context, resolver per config, optional mode, adapters
 ├── Tenancy/ApplicationTestCase.php               — bootstrapped app with a temp config/tenancy.php
 ├── Resolver/TenantResolverTest.php               — every resolver and RequestHost
-├── Middleware/ResolveTenantMiddlewareTest.php    — activation, 404 cases, optional mode, restore on exception
+├── Middleware/ResolveTenantMiddlewareTest.php    — activation, 404 cases, optional mode, restore on exception, streamed body after restore
+├── Queue/TenantAwareQueueTest.php                — tenant carried push → pop through serialization, no-tenant jobs untouched, empty/unknown tenant clears, failed() wraps once
 ├── Cache/TenantScopedCacheTest.php               — isolation, all key-based ops, tags, flush/stats, no-tenant failure
 └── Search/TenantScopedSearchDriverTest.php       — index naming for every operation, no-tenant failure
 ```
@@ -331,7 +335,9 @@ tests/
 - **Only known tenants are activated.** Resolvers produce candidates; the middleware validates the id and looks it up in `TenantStoreInterface`. Otherwise any Host header or path segment would become a tenant — and a fresh cache prefix and index.
 - **Resolution is not authorization.** With the header or path resolver, a signed-in user of tenant A can name tenant B, which is a known tenant. Checking that the user belongs to the active tenant is the application's job (or `ez-php/authorization`), after this middleware. `subdomain` is the default resolver.
 - **No fallback to the shared store.** Without an active tenant, `TenantScopedCache` and `TenantScopedSearchDriver` throw `TenancyException` instead of using unprefixed keys/indexes, where tenants would see each other's data. CLI and queue work wraps itself in `TenantContext::run()`.
+- **Queue jobs carry their tenant in an envelope, unwrapped on `pop()`.** `TenantAwareQueue` stores `{job, tenantId}` and, on `pop()`, activates the tenant and returns the *original* job — not a wrapper whose `handle()` runs it — so `ez-php/queue`'s Worker keeps applying the job's middleware, backoff, release and chain (all of which require a `Job` instance). The tenant then stays active until the next `pop()` replaces or clears it; it is not restored in `finally` because the Worker, not the decorator, runs the job. Retries re-pushed by the Worker go through `push()` while that tenant is active, and `failed()` archives an envelope, so both keep the tenant. Only `ez-php/contracts`' `QueueInterface`/`JobInterface` are used, so there is no dependency on `ez-php/queue`.
 - **The previous tenant is always restored** — by `run()` and by the middleware, in `finally`. Long-running workers and back-to-back test requests never inherit a tenant.
+- **A `StreamedResponse` body runs after the tenant is restored.** The body is written by `Application::send()`, after the middleware returned, and `StreamedResponse::writeBody()` is push-style over a private generator — the middleware cannot re-activate the tenant around it without buffering the stream or a new `ez-php/http` hook. Streaming actions capture `current()` and wrap their work in `TenantContext::run()` (README § Streamed responses); `ResolveTenantMiddlewareTest` pins the behaviour.
 - **`TenantContext` is one mutable holder per process.** The provider registers it with `instance()`, so the middleware and adapters share it; resolve it on the root container, not a `scope()` child. It is not fiber-aware: concurrent fibers (an `ez-php/websocket` server) would share one active tenant. `Tenant` itself is the immutable part.
 - **`flush()`/`stats()` on `TenantScopedCache` act on the whole shared store** — every tenant — exactly like `PrefixedCache` (from ez-php/cache). Invalidate one tenant's entries with a tag; `tags()` is built on the tenant's `PrefixedCache`, so tag lists are prefixed.
 - **Adapters are opt-in.** The provider binds `TenantScopedCache` / `TenantScopedSearchDriver` under their own names and never rebinds `CacheInterface`/`SearchDriverInterface` (a provider must not replace another module's binding). `ez-php/cache` and `ez-php/search` are `suggest`s.
@@ -360,6 +366,7 @@ tests/
 | Checking that a user belongs to the active tenant | Application layer / `ez-php/authorization` |
 | Database-per-tenant connection switching | Not supported (single-database design); a future module |
 | Tenant provisioning, per-tenant migrations | Application layer |
+| Per-tenant queues / queue isolation | Application (queue names per tenant); `TenantAwareQueue` only carries the tenant id |
 | ORM global scopes (`WHERE tenant_id = ?`) | Application repositories (a possible future `ez-php/orm` feature) |
 | Database-backed tenant store | Application — implement `TenantStoreInterface` |
 | Trusted-proxy / `X-Forwarded-Host` handling | Application or reverse-proxy configuration |
