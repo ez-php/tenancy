@@ -28,7 +28,13 @@ use Throwable;
  *
  * A tenant id the store no longer knows clears the context: tenant-scoped code in
  * the job then fails with "No tenant is active" and the job takes the normal
- * failure path instead of running for the wrong tenant.
+ * failure path instead of running for the wrong tenant. The id stays attached until
+ * the next pop(), so the retry or failed-job record keeps it for when the tenant is
+ * restored.
+ *
+ * A store that throws on pop() puts the envelope back and rethrows: the driver has
+ * already removed the job, so swallowing or just propagating the failure would lose
+ * it. The Worker stops, as it does when the driver itself is unavailable.
  *
  * Uses only ez-php/contracts' queue interfaces — no ez-php/queue dependency. Wrap
  * the bound QueueInterface in your own provider (see README); like ez-php/queue's
@@ -36,17 +42,22 @@ use Throwable;
  *
  * @package EzPhp\Tenancy\Queue
  */
-final readonly class TenantAwareQueue implements QueueInterface
+final class TenantAwareQueue implements QueueInterface
 {
+    /**
+     * Tenant id of the envelope popped last; null for a job without one.
+     */
+    private ?string $poppedTenantId = null;
+
     /**
      * @param QueueInterface       $queue   The real queue driver.
      * @param TenantContext        $context Shared holder of the active tenant.
      * @param TenantStoreInterface $store   Resolves the stored tenant id on pop().
      */
     public function __construct(
-        private QueueInterface $queue,
-        private TenantContext $context,
-        private TenantStoreInterface $store,
+        private readonly QueueInterface $queue,
+        private readonly TenantContext $context,
+        private readonly TenantStoreInterface $store,
     ) {
     }
 
@@ -65,13 +76,23 @@ final readonly class TenantAwareQueue implements QueueInterface
     {
         $job = $this->queue->pop($queue);
 
-        if (!$job instanceof TenantQueueEnvelope) {
-            $this->context->set(null);
+        $this->context->set(null);
+        $this->poppedTenantId = null;
 
+        if (!$job instanceof TenantQueueEnvelope) {
             return $job;
         }
 
-        $this->context->set($this->store->find($job->tenantId()));
+        try {
+            $tenant = $this->store->find($job->tenantId());
+        } catch (Throwable $e) {
+            $this->queue->push($job);
+
+            throw $e;
+        }
+
+        $this->context->set($tenant);
+        $this->poppedTenantId = $job->tenantId();
 
         return $job->job();
     }
@@ -99,12 +120,12 @@ final readonly class TenantAwareQueue implements QueueInterface
      */
     private function wrap(JobInterface $job): JobInterface
     {
-        $tenant = $this->context->get();
+        $tenantId = $this->context->get()->id ?? $this->poppedTenantId;
 
-        if ($job instanceof TenantQueueEnvelope || $tenant === null) {
+        if ($job instanceof TenantQueueEnvelope || $tenantId === null) {
             return $job;
         }
 
-        return new TenantQueueEnvelope($job, $tenant->id);
+        return new TenantQueueEnvelope($job, $tenantId);
     }
 }

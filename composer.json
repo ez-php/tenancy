@@ -1,6 +1,6 @@
 {
   "name": "ez-php/tenancy",
-  "version": "2.7.0",
+  "version": "2.7.1",
   "description": "Single-database multi-tenancy primitives: tenant resolution per request, tenant context, tenant-scoped cache and search",
   "type": "library",
   "license": "MIT",

@@ -89,6 +89,11 @@ $this->app->bind(QueueInterface::class, fn ($app) => new TenantAwareQueue(
 Like `ez-php/queue`'s `UniqueQueue`, the decorator hides the driver's failed-job repository, so
 bind `FailedJobRepositoryInterface` to the driver yourself if you use `queue:failed`.
 
+A job whose tenant the store no longer knows runs with no tenant active, and its retry or
+failed-job record keeps the tenant id. If the store throws during `pop()`, the job goes back on
+the queue and the exception reaches the worker, so a store outage stops the worker instead of
+losing jobs.
+
 ### Streamed responses
 
 `ResolveTenantMiddleware` deactivates the tenant when the action returns, but a

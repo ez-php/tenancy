@@ -11,6 +11,7 @@ use EzPhp\Tenancy\Queue\TenantAwareQueue;
 use EzPhp\Tenancy\Queue\TenantQueueEnvelope;
 use EzPhp\Tenancy\Tenant;
 use EzPhp\Tenancy\TenantContext;
+use EzPhp\Tenancy\TenantStoreInterface;
 use PHPUnit\Framework\Attributes\CoversClass;
 use PHPUnit\Framework\Attributes\UsesClass;
 use RuntimeException;
@@ -94,6 +95,17 @@ final class TenancySerializingQueue implements QueueInterface
     public function failed(JobInterface $job, Throwable $exception): void
     {
         $this->failed[] = $job;
+    }
+}
+
+/**
+ * A tenant store whose backend is unavailable.
+ */
+final class TenancyFailingStore implements TenantStoreInterface
+{
+    public function find(string $id): ?Tenant
+    {
+        throw new RuntimeException('store down');
     }
 }
 
@@ -185,6 +197,69 @@ final class TenantAwareQueueTest extends TestCase
         self::assertSame('acme', $this->driver->failed[0]->tenantId());
         self::assertInstanceOf(TenantQueueEnvelope::class, $this->driver->failed[1]);
         self::assertSame('globex', $this->driver->failed[1]->tenantId(), 'an envelope is never wrapped twice');
+    }
+
+    public function test_a_failing_tenant_lookup_puts_the_job_back_and_rethrows(): void
+    {
+        $context = new TenantContext();
+        $context->set(new Tenant('globex'));
+        $this->driver->push(new TenantQueueEnvelope(new TenancyRecordingJob('invoice'), 'acme'));
+
+        $failing = new TenantAwareQueue($this->driver, $context, new TenancyFailingStore());
+
+        try {
+            $failing->pop();
+            self::fail('The store failure must reach the caller.');
+        } catch (RuntimeException $e) {
+            self::assertSame('store down', $e->getMessage());
+        }
+
+        self::assertNull($context->get(), 'the previous job\'s tenant must not stay active');
+        self::assertSame(1, $this->driver->size());
+
+        $recovered = new TenantContext();
+        $job = $this->queue($recovered)->pop();
+
+        self::assertInstanceOf(TenancyRecordingJob::class, $job);
+        self::assertSame('invoice', $job->name);
+        self::assertSame('acme', $recovered->get()?->id);
+    }
+
+    public function test_a_job_of_an_unknown_tenant_keeps_its_tenant_id_when_failed_or_retried(): void
+    {
+        $context = new TenantContext();
+        $queue = $this->queue($context);
+        $this->driver->push(new TenantQueueEnvelope(new TenancyRecordingJob('invoice'), 'deleted'));
+
+        $job = $queue->pop();
+        self::assertNotNull($job);
+        self::assertNull($context->get());
+
+        $queue->failed($job, new RuntimeException('x'));
+        $queue->push($job);
+
+        self::assertInstanceOf(TenantQueueEnvelope::class, $this->driver->failed[0]);
+        self::assertSame('deleted', $this->driver->failed[0]->tenantId());
+
+        $retried = unserialize($this->driver->jobs[0]);
+        self::assertInstanceOf(TenantQueueEnvelope::class, $retried);
+        self::assertSame('deleted', $retried->tenantId());
+    }
+
+    public function test_the_next_pop_forgets_the_unknown_tenant(): void
+    {
+        $context = new TenantContext();
+        $queue = $this->queue($context);
+        $this->driver->push(new TenantQueueEnvelope(new TenancyRecordingJob('first'), 'deleted'));
+        $this->driver->push(new TenancyRecordingJob('second'));
+
+        $queue->pop();
+        $second = $queue->pop();
+        self::assertNotNull($second);
+
+        $queue->failed($second, new RuntimeException('x'));
+
+        self::assertInstanceOf(TenancyRecordingJob::class, $this->driver->failed[0]);
     }
 
     public function test_handle_and_fail_delegate_when_popped_without_the_decorator(): void
